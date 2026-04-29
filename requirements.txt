@@ -1,7 +1,6 @@
-fastapi==0.110.0
-uvicorn==0.27.1
-python-multipart==0.0.9
-pydantic==2.6.3
-ultralytics==8.3.91
-python-docx==1.1.0
-gdown==5.1.0
+fastapi
+uvicorn
+python-multipart
+ultralytics
+python-docx
+gdown
