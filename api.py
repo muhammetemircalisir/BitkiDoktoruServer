@@ -15,6 +15,11 @@ THRESHOLD = 0.70
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MODEL_PATH = os.path.join(BASE_DIR, "best.pt")
 
+if not os.path.exists(MODEL_PATH):
+    print("Yapay zeka modeli (best.pt) Google Drive'dan indiriliyor...")
+    import gdown
+    gdown.download(id="1x2UePdG2rNPPvIGQ4OA_J9nK8wZYFrwq", output=MODEL_PATH, quiet=False)
+
 try:
     my_model = YOLO(MODEL_PATH)
     print("YOLO Model loaded successfully.")
