@@ -294,6 +294,31 @@ def get_stats():
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
 
+class StatRequest(BaseModel):
+    phone: str
+    label: str
+
+@app.post("/add_stat")
+def add_stat(req: StatRequest):
+    try:
+        city = "Bilinmiyor"
+        district = "Bilinmiyor"
+        conn = sqlite3.connect('database.db')
+        c = conn.cursor()
+        c.execute("SELECT city, district FROM users WHERE phone=?", (req.phone,))
+        res = c.fetchone()
+        if res:
+            city, district = res[0], res[1]
+        
+        from datetime import datetime
+        c.execute("INSERT INTO predictions (phone, label, city, district, timestamp) VALUES (?, ?, ?, ?, ?)",
+                  (req.phone, req.label, city, district, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+        conn.commit()
+        conn.close()
+        return {"success": True, "message": "Stat added successfully."}
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
 @app.post("/predict")
 async def predict_disease(phone: str = Form(default="Bilinmiyor"), file: UploadFile = File(...)):
     if not my_model:
