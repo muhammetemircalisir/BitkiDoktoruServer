@@ -15,11 +15,6 @@ THRESHOLD = 0.70
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MODEL_PATH = os.path.join(BASE_DIR, "best.pt")
 
-if not os.path.exists(MODEL_PATH):
-    print("Yapay zeka modeli (best.pt) Google Drive'dan indiriliyor...")
-    import gdown
-    gdown.download(id="1x2UePdG2rNPPvIGQ4OA_J9nK8wZYFrwq", output=MODEL_PATH, quiet=False)
-
 try:
     my_model = YOLO(MODEL_PATH)
     print("YOLO Model loaded successfully.")
@@ -291,6 +286,19 @@ def get_stats():
         
         conn.close()
         return {"user_counts_by_region": user_counts, "disease_counts_by_region": disease_counts}
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+@app.get("/reset_db")
+def reset_database():
+    try:
+        conn = sqlite3.connect('database.db')
+        c = conn.cursor()
+        c.execute("DELETE FROM predictions")
+        c.execute("DELETE FROM users")
+        conn.commit()
+        conn.close()
+        return {"success": True, "message": "Veritabanı (Tüm test verileri) başarıyla sıfırlandı!"}
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
 
