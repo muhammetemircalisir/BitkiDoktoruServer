@@ -244,13 +244,52 @@ def register_user(user: User):
     try:
         conn = sqlite3.connect('database.db')
         c = conn.cursor()
-        c.execute("INSERT OR REPLACE INTO users (phone, first_name, last_name, city, district, neighborhood, village, password) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        
+        # Numara zaten var mı diye kontrol et
+        c.execute("SELECT phone FROM users WHERE phone=?", (user.phone,))
+        existing_user = c.fetchone()
+        
+        if existing_user:
+            conn.close()
+            return JSONResponse(status_code=400, content={"error": "Phone number is already registered."})
+            
+        c.execute("INSERT INTO users (phone, first_name, last_name, city, district, neighborhood, village, password) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                   (user.phone, user.first_name, user.last_name, user.city, user.district, user.neighborhood, user.village, user.password))
         conn.commit()
         conn.close()
         return {"success": True, "message": "User registered successfully."}
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
+
+# ================= YÖNETİCİ (ADMIN) İŞLEMLERİ =================
+
+@app.get("/admin/users")
+def get_all_users():
+    """Sistemdeki tüm kullanıcıları listeler."""
+    try:
+        conn = sqlite3.connect('database.db')
+        c = conn.cursor()
+        c.execute("SELECT phone, first_name, last_name, city FROM users")
+        users = [{"phone": row[0], "name": f"{row[1]} {row[2]}", "city": row[3]} for row in c.fetchall()]
+        conn.close()
+        return {"total_users": len(users), "users": users}
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+@app.get("/admin/clear_users")
+def clear_all_users():
+    """Hatalı kayıtları sıfırlamak için tüm veritabanını siler."""
+    try:
+        conn = sqlite3.connect('database.db')
+        c = conn.cursor()
+        c.execute("DELETE FROM users")
+        conn.commit()
+        conn.close()
+        return {"success": True, "message": "Tüm kullanıcılar veritabanından başarıyla silindi. Temiz bir sayfa açıldı."}
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+# ==============================================================
 
 class LoginRequest(BaseModel):
     phone: str
