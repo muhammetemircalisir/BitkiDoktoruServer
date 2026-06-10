@@ -10,6 +10,8 @@ from PIL import Image
 from ultralytics import YOLO
 import docx
 import re
+import urllib.request
+import json
 
 app = FastAPI(title="Plant Disease Detection API")
 
@@ -24,6 +26,93 @@ except Exception as e:
     print(f"Error loading model: {e}")
     my_model = None
 
+# Firebase Sync and Write Helpers
+def sync_users_from_firebase():
+    try:
+        url = "https://bitkidoktoru-3b50b-default-rtdb.firebaseio.com/users.json"
+        with urllib.request.urlopen(url) as response:
+            data = response.read().decode("utf-8")
+            if data and data != "null":
+                users = json.loads(data)
+                conn = sqlite3.connect('database.db')
+                c = conn.cursor()
+                c.execute("DELETE FROM users")
+                for phone, u in users.items():
+                    if not u:
+                        continue
+                    c.execute("""INSERT OR REPLACE INTO users (phone, first_name, last_name, city, district, neighborhood, village, password, crops) 
+                                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                              (phone, u.get("first_name", ""), u.get("last_name", ""), u.get("city", ""), u.get("district", ""), u.get("neighborhood", ""), u.get("village", ""), u.get("password", ""), u.get("crops", "")))
+                conn.commit()
+                conn.close()
+                print(f"✅ Synced {len(users)} users from Firebase to local SQLite.")
+    except Exception as e:
+        print(f"Error syncing users from Firebase: {e}")
+
+def sync_predictions_from_firebase():
+    try:
+        url = "https://bitkidoktoru-3b50b-default-rtdb.firebaseio.com/predictions.json"
+        with urllib.request.urlopen(url) as response:
+            data = response.read().decode("utf-8")
+            if data and data != "null":
+                preds = json.loads(data)
+                conn = sqlite3.connect('database.db')
+                c = conn.cursor()
+                c.execute("DELETE FROM predictions")
+                for pred_id, p in preds.items():
+                    if not p:
+                        continue
+                    c.execute("""INSERT OR REPLACE INTO predictions (id, phone, label, city, district, timestamp) 
+                                 VALUES (?, ?, ?, ?, ?, ?)""",
+                              (pred_id, p.get("phone", ""), p.get("label", ""), p.get("city", ""), p.get("district", ""), p.get("timestamp", "")))
+                conn.commit()
+                conn.close()
+                print(f"✅ Synced {len(preds)} predictions from Firebase to local SQLite.")
+    except Exception as e:
+        print(f"Error syncing predictions from Firebase: {e}")
+
+def firebase_put_user(phone: str, user_data: dict):
+    try:
+        url = f"https://bitkidoktoru-3b50b-default-rtdb.firebaseio.com/users/{phone}.json"
+        req = urllib.request.Request(url, data=json.dumps(user_data).encode("utf-8"), method="PUT")
+        urllib.request.urlopen(req)
+    except Exception as e:
+        print(f"Error writing user to Firebase: {e}")
+
+def firebase_delete_user(phone: str):
+    try:
+        url = f"https://bitkidoktoru-3b50b-default-rtdb.firebaseio.com/users/{phone}.json"
+        req = urllib.request.Request(url, method="DELETE")
+        urllib.request.urlopen(req)
+    except Exception as e:
+        print(f"Error deleting user from Firebase: {e}")
+
+def firebase_post_prediction(pred_data: dict) -> str:
+    try:
+        url = "https://bitkidoktoru-3b50b-default-rtdb.firebaseio.com/predictions.json"
+        req = urllib.request.Request(url, data=json.dumps(pred_data).encode("utf-8"), method="POST")
+        with urllib.request.urlopen(req) as resp:
+            res = json.loads(resp.read().decode("utf-8"))
+            return res.get("name", "")
+    except Exception as e:
+        print(f"Error writing prediction to Firebase: {e}")
+        return ""
+
+def update_predictions_phone_in_firebase(old_phone: str, new_phone: str):
+    try:
+        url = "https://bitkidoktoru-3b50b-default-rtdb.firebaseio.com/predictions.json"
+        with urllib.request.urlopen(url) as response:
+            data = response.read().decode("utf-8")
+            if data and data != "null":
+                preds = json.loads(data)
+                for pred_id, p in preds.items():
+                    if p and p.get("phone") == old_phone:
+                        url_patch = f"https://bitkidoktoru-3b50b-default-rtdb.firebaseio.com/predictions/{pred_id}.json"
+                        req = urllib.request.Request(url_patch, data=json.dumps({"phone": new_phone}).encode("utf-8"), method="PATCH")
+                        urllib.request.urlopen(req)
+    except Exception as e:
+        print(f"Error updating predictions phone in Firebase: {e}")
+
 def init_db():
     conn = sqlite3.connect('database.db')
     c = conn.cursor()
@@ -34,10 +123,12 @@ def init_db():
                     city TEXT,
                     district TEXT,
                     neighborhood TEXT,
-                    village TEXT
+                    village TEXT,
+                    password TEXT,
+                    crops TEXT DEFAULT ''
                  )''')
     c.execute('''CREATE TABLE IF NOT EXISTS predictions (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    id TEXT PRIMARY KEY,
                     phone TEXT,
                     label TEXT,
                     city TEXT,
@@ -47,12 +138,12 @@ def init_db():
     c.execute("CREATE INDEX IF NOT EXISTS idx_predictions_city_district ON predictions(city, district)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_predictions_label ON predictions(label)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_users_city_district ON users(city, district)")
-    try:
-        c.execute("ALTER TABLE users ADD COLUMN crops TEXT DEFAULT ''")
-    except sqlite3.OperationalError:
-        pass
     conn.commit()
     conn.close()
+    
+    # Sync database from Firebase Realtime Database
+    sync_users_from_firebase()
+    sync_predictions_from_firebase()
 
 init_db()
 
@@ -92,24 +183,14 @@ WORD_DOSYA_YOLU = os.path.join(BASE_DIR, "bitki tedavileri.docx")
 _son_degisiklik_zamani = 0.0
 
 def word_dosyasindan_oku(dosya_yolu):
-    """Word dosyasındaki hastalık tedavilerini okur ve anahtar:tedavi sözlüğü döndürür.
-    
-    Beklenen başlık formatı: Türkçe Ad (İngilizce Ad) :
-    Örnek: Fasulye Pası (Bean Rust) :
-    Başlık tespiti: satırda parantez içinde İngilizce isim varsa başlık kabul edilir.
-    Sonundaki iki nokta üst üste olsun ya da olmasın çalışır.
-    """
     tedavi_sozlugu = {}
     try:
         doc = docx.Document(dosya_yolu)
         guncel_hastalik_id = None
         guncel_tedavi = []
-
-        # Parantez içindeki metni yakalayan regex
         baslik_deseni = re.compile(r'\(([^)]+)\)')
 
         def baslik_mi(text):
-            """Bu satır bir hastalık başlığı mı?"""
             if len(text) > 150: return None
             if ":" not in text: return None
             eslesme = baslik_deseni.search(text)
@@ -126,18 +207,14 @@ def word_dosyasindan_oku(dosya_yolu):
 
             en_kisim = baslik_mi(metin)
             if en_kisim:
-                # Önceki hastalığı kaydet
                 if guncel_hastalik_id and guncel_tedavi:
                     tedavi_sozlugu[guncel_hastalik_id] = "\n".join(guncel_tedavi).strip()
 
-                # Parantez içindeki İngilizce adı anahtar yap
                 guncel_hastalik_id = en_kisim.lower().replace(" ", "_")
                 guncel_tedavi = []
 
-                # Başlık satırında iki nokta sonrası metin varsa onu da ekle
                 if ":" in metin:
                     kalani = metin.split(":", 1)[-1].strip()
-                    # Parantez kısmını temizle
                     kalani = re.sub(r'\([^)]*\)', '', kalani).strip()
                     if kalani:
                         guncel_tedavi.append(kalani)
@@ -145,7 +222,6 @@ def word_dosyasindan_oku(dosya_yolu):
                 if guncel_hastalik_id:
                     guncel_tedavi.append(metin)
 
-        # Döngü bitince son kalan hastalığı kaydet
         if guncel_hastalik_id and guncel_tedavi:
             tedavi_sozlugu[guncel_hastalik_id] = "\n".join(guncel_tedavi).strip()
 
@@ -158,7 +234,6 @@ def word_dosyasindan_oku(dosya_yolu):
 
 
 def word_yenile_gerekiyorsa():
-    """Word dosyası değiştiyse tedavi verilerini otomatik yeniden yükler."""
     global TREATMENT_DATA, _son_degisiklik_zamani
     try:
         suanki_zaman = os.path.getmtime(WORD_DOSYA_YOLU)
@@ -170,7 +245,6 @@ def word_yenile_gerekiyorsa():
         print(f"Dosya kontrol hatası: {e}")
 
 
-# İlk yükleme
 TREATMENT_DATA = word_dosyasindan_oku(WORD_DOSYA_YOLU)
 try:
     _son_degisiklik_zamani = os.path.getmtime(WORD_DOSYA_YOLU)
@@ -178,9 +252,6 @@ except Exception:
     pass
 
 
-# Model etiketleri (YOLO çıktısı) <-> Word'den parse edilen anahtarlar arasındaki köprü
-# Word'deki parantez içi İngilizce ad: lowercase + alt çizgi → word_key
-# Bazı model etiketleri Word başlığıyla tam eşleşmiyor, bu tablo köprü görevi görür
 LABEL_TO_WORD_KEY = {
     "bean_angular_leaf_spot":   "bean_angular_leaf_spot",
     "bean_rust":                "bean_rust",
@@ -205,19 +276,14 @@ LABEL_TO_WORD_KEY = {
 
 
 def get_treatment(label: str) -> str:
-    """Model etiketine göre Word'den okunan tedavi metnini döndürür."""
-    # 1. Doğrudan eşleşme
     if label in TREATMENT_DATA:
         return TREATMENT_DATA[label]
-    # 2. Eşleşme tablosu üzerinden
     word_key = LABEL_TO_WORD_KEY.get(label)
     if word_key and word_key in TREATMENT_DATA:
         return TREATMENT_DATA[word_key]
-    # 3. Normalize ederek deneme (küçük harf + alt çizgi)
     normalized = label.lower().replace(" ", "_")
     if normalized in TREATMENT_DATA:
         return TREATMENT_DATA[normalized]
-    # 4. Kısmi eşleşme (bir taraf diğerini içeriyor mu)
     for key, value in TREATMENT_DATA.items():
         if normalized in key or key in normalized:
             return value
@@ -267,36 +333,47 @@ def read_root():
 @app.get("/check-phone")
 def check_phone(phone: str):
     try:
-        conn = sqlite3.connect('database.db')
-        c = conn.cursor()
-        c.execute("SELECT phone FROM users WHERE phone=?", (phone,))
-        user = c.fetchone()
-        conn.close()
-        if user:
-            return {"exists": True, "message": "Bu telefon numarası zaten kayıtlı."}
-        else:
-            return {"exists": False, "message": "Telefon numarası kullanılabilir."}
+        url = f"https://bitkidoktoru-3b50b-default-rtdb.firebaseio.com/users/{phone}.json"
+        with urllib.request.urlopen(url) as response:
+            data = response.read().decode("utf-8")
+            if data and data != "null":
+                return {"exists": True, "message": "Bu telefon numarası zaten kayıtlı."}
+            else:
+                return {"exists": False, "message": "Telefon numarası kullanılabilir."}
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
 
 @app.post("/register")
 def register_user(user: User):
     try:
+        url = f"https://bitkidoktoru-3b50b-default-rtdb.firebaseio.com/users/{user.phone}.json"
+        with urllib.request.urlopen(url) as response:
+            data = response.read().decode("utf-8")
+            if data and data != "null":
+                return JSONResponse(status_code=400, content={"error": "already registered"})
+            
+        user_dict = {
+            "phone": user.phone,
+            "first_name": user.first_name,
+            "last_name": user.last_name,
+            "city": user.city,
+            "district": user.district,
+            "neighborhood": user.neighborhood,
+            "village": user.village,
+            "password": user.password,
+            "crops": user.crops
+        }
+        
+        firebase_put_user(user.phone, user_dict)
+        
         conn = sqlite3.connect('database.db')
         c = conn.cursor()
-        
-        # Numara zaten var mı diye kontrol et
-        c.execute("SELECT phone FROM users WHERE phone=?", (user.phone,))
-        existing_user = c.fetchone()
-        
-        if existing_user:
-            conn.close()
-            return JSONResponse(status_code=400, content={"error": "Phone number is already registered."})
-            
-        c.execute("INSERT INTO users (phone, first_name, last_name, city, district, neighborhood, village, password, crops) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        c.execute("""INSERT OR REPLACE INTO users (phone, first_name, last_name, city, district, neighborhood, village, password, crops) 
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                   (user.phone, user.first_name, user.last_name, user.city, user.district, user.neighborhood, user.village, user.password, user.crops))
         conn.commit()
         conn.close()
+        
         return {"success": True, "message": "User registered successfully."}
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
@@ -304,89 +381,111 @@ def register_user(user: User):
 @app.post("/login")
 def login_user(req: LoginRequest):
     try:
-        conn = sqlite3.connect('database.db')
-        c = conn.cursor()
-        c.execute("SELECT first_name, last_name, city FROM users WHERE phone=? AND password=?", (req.phone, req.password))
-        user = c.fetchone()
-        conn.close()
-        
-        if user:
-            return {
-                "success": True, 
-                "message": f"Hoşgeldiniz, {user[0]} {user[1]}!",
-                "first_name": user[0],
-                "last_name": user[1],
-                "city": user[2]
-            }
-        else:
-            return {"success": False, "error": "Sisteme kayıtlı değilsiniz veya şifreniz yanlış! Lütfen Kayıt Olun."}
+        url = f"https://bitkidoktoru-3b50b-default-rtdb.firebaseio.com/users/{req.phone}.json"
+        with urllib.request.urlopen(url) as response:
+            data = response.read().decode("utf-8")
+            if not data or data == "null":
+                return {"success": False, "error": "Sisteme kayıtlı değilsiniz veya şifreniz yanlış! Lütfen Kayıt Olun."}
+            
+            user = json.loads(data)
+            if user.get("password") == req.password:
+                conn = sqlite3.connect('database.db')
+                c = conn.cursor()
+                c.execute("""INSERT OR REPLACE INTO users (phone, first_name, last_name, city, district, neighborhood, village, password, crops) 
+                             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                          (user.get("phone"), user.get("first_name"), user.get("last_name"), user.get("city"), user.get("district"), user.get("neighborhood"), user.get("village"), user.get("password"), user.get("crops", "")))
+                conn.commit()
+                conn.close()
+                
+                return {
+                    "success": True, 
+                    "message": f"Hoşgeldiniz, {user.get('first_name')} {user.get('last_name')}!",
+                    "first_name": user.get("first_name"),
+                    "last_name": user.get("last_name"),
+                    "city": user.get("city")
+                }
+            else:
+                return {"success": False, "error": "Sisteme kayıtlı değilsiniz veya şifreniz yanlış! Lütfen Kayıt Olun."}
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
 
 @app.get("/get-profile")
 def get_profile(phone: str):
     try:
-        conn = sqlite3.connect('database.db')
-        c = conn.cursor()
-        c.execute("SELECT phone, first_name, last_name, city, district, neighborhood, village, crops FROM users WHERE phone=?", (phone,))
-        row = c.fetchone()
-        conn.close()
-        if row:
+        url = f"https://bitkidoktoru-3b50b-default-rtdb.firebaseio.com/users/{phone}.json"
+        with urllib.request.urlopen(url) as response:
+            data = response.read().decode("utf-8")
+            if not data or data == "null":
+                return JSONResponse(status_code=404, content={"error": "Kullanıcı bulunamadı."})
+            
+            user = json.loads(data)
             return {
                 "success": True,
-                "phone": row[0],
-                "first_name": row[1],
-                "last_name": row[2],
-                "city": row[3],
-                "district": row[4],
-                "neighborhood": row[5],
-                "village": row[6],
-                "crops": row[7] if len(row) > 7 else ""
+                "phone": user.get("phone"),
+                "first_name": user.get("first_name"),
+                "last_name": user.get("last_name"),
+                "city": user.get("city"),
+                "district": user.get("district"),
+                "neighborhood": user.get("neighborhood"),
+                "village": user.get("village"),
+                "crops": user.get("crops", "")
             }
-        else:
-            return JSONResponse(status_code=404, content={"error": "Kullanıcı bulunamadı."})
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
 
 @app.post("/update-profile")
 def update_profile(req: UpdateProfileRequest):
     try:
-        conn = sqlite3.connect('database.db')
-        c = conn.cursor()
+        url = f"https://bitkidoktoru-3b50b-default-rtdb.firebaseio.com/users/{req.old_phone}.json"
+        password = ""
+        with urllib.request.urlopen(url) as response:
+            data = response.read().decode("utf-8")
+            if data and data != "null":
+                password = json.loads(data).get("password", "")
         
         if req.phone != req.old_phone:
-            c.execute("SELECT phone FROM users WHERE phone=?", (req.phone,))
-            if c.fetchone():
-                conn.close()
-                return JSONResponse(status_code=400, content={"error": "Bu telefon numarası zaten başka biri tarafından kullanılıyor."})
+            url_new = f"https://bitkidoktoru-3b50b-default-rtdb.firebaseio.com/users/{req.phone}.json"
+            with urllib.request.urlopen(url_new) as response:
+                data = response.read().decode("utf-8")
+                if data and data != "null":
+                    return JSONResponse(status_code=400, content={"error": "Bu telefon numarası zaten başka biri tarafından kullanılıyor."})
+            
+            firebase_delete_user(req.old_phone)
+            conn = sqlite3.connect('database.db')
+            c = conn.cursor()
+            c.execute("DELETE FROM users WHERE phone=?", (req.old_phone,))
+            conn.commit()
+            conn.close()
+            
+        user_dict = {
+            "phone": req.phone,
+            "first_name": req.first_name,
+            "last_name": req.last_name,
+            "city": req.city,
+            "district": req.district,
+            "neighborhood": req.neighborhood,
+            "village": req.village,
+            "password": password,
+            "crops": req.crops
+        }
         
-        c.execute("""UPDATE users SET 
-                        phone=?, 
-                        first_name=?, 
-                        last_name=?, 
-                        city=?, 
-                        district=?, 
-                        neighborhood=?, 
-                        village=?,
-                        crops=? 
-                     WHERE phone=?""",
-                  (req.phone, req.first_name, req.last_name, req.city, req.district, req.neighborhood, req.village, req.crops, req.old_phone))
+        firebase_put_user(req.phone, user_dict)
         
-        # Upsert: if Render DB has reset and user is missing, insert them
-        if c.rowcount == 0:
-            c.execute("""INSERT INTO users (phone, first_name, last_name, city, district, neighborhood, village, crops) 
-                         VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                      (req.phone, req.first_name, req.last_name, req.city, req.district, req.neighborhood, req.village, req.crops))
+        conn = sqlite3.connect('database.db')
+        c = conn.cursor()
+        c.execute("""INSERT OR REPLACE INTO users (phone, first_name, last_name, city, district, neighborhood, village, password, crops) 
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                  (req.phone, req.first_name, req.last_name, req.city, req.district, req.neighborhood, req.village, password, req.crops))
         
         c.execute("UPDATE predictions SET phone=? WHERE phone=?", (req.phone, req.old_phone))
-        
         conn.commit()
         conn.close()
+        
+        if req.phone != req.old_phone:
+            update_predictions_phone_in_firebase(req.old_phone, req.phone)
+            
         return {"success": True, "message": "Profil bilgileri başarıyla güncellendi."}
     except Exception as e:
-        if 'conn' in locals() or 'conn' in globals():
-            try: conn.close()
-            except: pass
         return JSONResponse(status_code=500, content={"error": str(e)})
 
 @app.get("/stats")
@@ -395,7 +494,6 @@ def get_stats(city: str = None, district: str = None, label: str = None):
         conn = sqlite3.connect('database.db')
         c = conn.cursor()
         
-        # 1. Kullanıcı sayıları sorgusu
         users_query = "SELECT city, district, COUNT(*) FROM users"
         users_conditions = []
         users_params = []
@@ -413,7 +511,6 @@ def get_stats(city: str = None, district: str = None, label: str = None):
         c.execute(users_query, users_params)
         user_counts = [{"city": row[0], "district": row[1], "count": row[2]} for row in c.fetchall()]
         
-        # 2. Tahminler / Hastalık sayıları sorgusu
         predictions_query = "SELECT city, district, label, COUNT(*) FROM predictions"
         pred_conditions = []
         pred_params = []
@@ -444,17 +541,32 @@ def add_stat(req: StatRequest):
     try:
         city = "Bilinmiyor"
         district = "Bilinmiyor"
+        
+        url = f"https://bitkidoktoru-3b50b-default-rtdb.firebaseio.com/users/{req.phone}.json"
+        with urllib.request.urlopen(url) as response:
+            data = response.read().decode("utf-8")
+            if data and data != "null":
+                u = json.loads(data)
+                city, district = u.get("city", "Bilinmiyor"), u.get("district", "Bilinmiyor")
+        
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        pred_dict = {
+            "phone": req.phone,
+            "label": req.label,
+            "city": city,
+            "district": district,
+            "timestamp": timestamp
+        }
+        
+        firebase_id = firebase_post_prediction(pred_dict)
+        
         conn = sqlite3.connect('database.db')
         c = conn.cursor()
-        c.execute("SELECT city, district FROM users WHERE phone=?", (req.phone,))
-        res = c.fetchone()
-        if res:
-            city, district = res[0], res[1]
-        
-        c.execute("INSERT INTO predictions (phone, label, city, district, timestamp) VALUES (?, ?, ?, ?, ?)",
-                  (req.phone, req.label, city, district, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+        c.execute("INSERT OR REPLACE INTO predictions (id, phone, label, city, district, timestamp) VALUES (?, ?, ?, ?, ?, ?)",
+                  (firebase_id if firebase_id else str(datetime.now().timestamp()), req.phone, req.label, city, district, timestamp))
         conn.commit()
         conn.close()
+        
         return {"success": True, "message": "Stat added successfully."}
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
@@ -464,7 +576,6 @@ async def predict_disease(phone: str = Form(default="Bilinmiyor"), file: UploadF
     if not my_model:
         return JSONResponse(status_code=500, content={"error": "Model not loaded on server."})
 
-    # Word dosyası değiştiyse tedavileri otomatik yenile
     word_yenile_gerekiyorsa()
 
     try:
@@ -489,7 +600,6 @@ async def predict_disease(phone: str = Form(default="Bilinmiyor"), file: UploadF
             
             formatted_disease_name = DISEASE_NAMES.get(label, label)
             
-            # Veriseti klasorune kaydetme
             try:
                 dataset_folder = os.path.join(BASE_DIR, "GenelVeriseti")
                 os.makedirs(dataset_folder, exist_ok=True)
@@ -499,19 +609,32 @@ async def predict_disease(phone: str = Form(default="Bilinmiyor"), file: UploadF
             except Exception as save_err:
                 print("Veriseti kaydedilemedi:", save_err)
 
-            # Veritabanına Tahmin Sonucunu Kaydetme (Bölgesel Analiz için)
             try:
                 city = "Bilinmiyor"
                 district = "Bilinmiyor"
+                
+                url = f"https://bitkidoktoru-3b50b-default-rtdb.firebaseio.com/users/{phone}.json"
+                with urllib.request.urlopen(url) as response:
+                    data = response.read().decode("utf-8")
+                    if data and data != "null":
+                        u = json.loads(data)
+                        city, district = u.get("city", "Bilinmiyor"), u.get("district", "Bilinmiyor")
+                
+                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                pred_dict = {
+                    "phone": phone,
+                    "label": label,
+                    "city": city,
+                    "district": district,
+                    "timestamp": timestamp
+                }
+                
+                firebase_id = firebase_post_prediction(pred_dict)
+                
                 conn = sqlite3.connect('database.db')
                 c = conn.cursor()
-                c.execute("SELECT city, district FROM users WHERE phone=?", (phone,))
-                res = c.fetchone()
-                if res:
-                    city, district = res[0], res[1]
-                
-                c.execute("INSERT INTO predictions (phone, label, city, district, timestamp) VALUES (?, ?, ?, ?, ?)",
-                          (phone, label, city, district, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+                c.execute("INSERT OR REPLACE INTO predictions (id, phone, label, city, district, timestamp) VALUES (?, ?, ?, ?, ?, ?)",
+                          (firebase_id if firebase_id else str(datetime.now().timestamp()), phone, label, city, district, timestamp))
                 conn.commit()
                 conn.close()
             except Exception as db_err:
@@ -524,7 +647,6 @@ async def predict_disease(phone: str = Form(default="Bilinmiyor"), file: UploadF
                 "tedavi": treatment
             }
         else:
-            # Tanimlanamayanlar da kaydedilebilir
             try:
                 dataset_folder = os.path.join(BASE_DIR, "GenelVeriseti", "Tanimlanamayan")
                 os.makedirs(dataset_folder, exist_ok=True)
@@ -548,7 +670,6 @@ async def predict_disease(phone: str = Form(default="Bilinmiyor"), file: UploadF
 
 @app.get("/admin/users")
 def get_all_users():
-    """Sistemdeki tüm kullanıcıları listeler."""
     try:
         conn = sqlite3.connect('database.db')
         c = conn.cursor()
@@ -561,13 +682,21 @@ def get_all_users():
 
 @app.get("/admin/clear_users")
 def clear_all_users():
-    """Hatalı kayıtları sıfırlamak için tüm veritabanını siler."""
     try:
         conn = sqlite3.connect('database.db')
         c = conn.cursor()
         c.execute("DELETE FROM users")
         conn.commit()
         conn.close()
+        
+        # Clear Firebase users too
+        try:
+            url = "https://bitkidoktoru-3b50b-default-rtdb.firebaseio.com/users.json"
+            req = urllib.request.Request(url, method="DELETE")
+            urllib.request.urlopen(req)
+        except Exception as fe:
+            print("Failed to clear Firebase users:", fe)
+            
         return {"success": True, "message": "Tüm kullanıcılar veritabanından başarıyla silindi. Temiz bir sayfa açıldı."}
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
