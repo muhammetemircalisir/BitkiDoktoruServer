@@ -8,6 +8,8 @@ import sqlite3
 from datetime import datetime
 from PIL import Image
 from ultralytics import YOLO
+import docx
+import re
 
 app = FastAPI(title="Plant Disease Detection API")
 
@@ -42,6 +44,13 @@ def init_db():
                     district TEXT,
                     timestamp TEXT
                  )''')
+    c.execute("CREATE INDEX IF NOT EXISTS idx_predictions_city_district ON predictions(city, district)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_predictions_label ON predictions(label)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_users_city_district ON users(city, district)")
+    try:
+        c.execute("ALTER TABLE users ADD COLUMN crops TEXT DEFAULT ''")
+    except sqlite3.OperationalError:
+        pass
     conn.commit()
     conn.close()
 
@@ -56,10 +65,26 @@ class User(BaseModel):
     district: str
     neighborhood: str
     village: str
+    crops: str = ""
 
-import docx
-import os
-import re
+class LoginRequest(BaseModel):
+    phone: str
+    password: str
+
+class UpdateProfileRequest(BaseModel):
+    old_phone: str
+    phone: str
+    first_name: str
+    last_name: str
+    city: str
+    district: str
+    neighborhood: str
+    village: str
+    crops: str = ""
+
+class StatRequest(BaseModel):
+    phone: str
+    label: str
 
 WORD_DOSYA_YOLU = os.path.join(BASE_DIR, "bitki tedavileri.docx")
 
@@ -239,6 +264,21 @@ DISEASE_NAMES = {
 def read_root():
     return {"message": "Plant Disease API is running."}
 
+@app.get("/check-phone")
+def check_phone(phone: str):
+    try:
+        conn = sqlite3.connect('database.db')
+        c = conn.cursor()
+        c.execute("SELECT phone FROM users WHERE phone=?", (phone,))
+        user = c.fetchone()
+        conn.close()
+        if user:
+            return {"exists": True, "message": "Bu telefon numarası zaten kayıtlı."}
+        else:
+            return {"exists": False, "message": "Telefon numarası kullanılabilir."}
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
 @app.post("/register")
 def register_user(user: User):
     try:
@@ -253,84 +293,151 @@ def register_user(user: User):
             conn.close()
             return JSONResponse(status_code=400, content={"error": "Phone number is already registered."})
             
-        c.execute("INSERT INTO users (phone, first_name, last_name, city, district, neighborhood, village, password) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                  (user.phone, user.first_name, user.last_name, user.city, user.district, user.neighborhood, user.village, user.password))
+        c.execute("INSERT INTO users (phone, first_name, last_name, city, district, neighborhood, village, password, crops) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                  (user.phone, user.first_name, user.last_name, user.city, user.district, user.neighborhood, user.village, user.password, user.crops))
         conn.commit()
         conn.close()
         return {"success": True, "message": "User registered successfully."}
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
 
-# ================= YÖNETİCİ (ADMIN) İŞLEMLERİ =================
-
-@app.get("/admin/users")
-def get_all_users():
-    """Sistemdeki tüm kullanıcıları listeler."""
-    try:
-        conn = sqlite3.connect('database.db')
-        c = conn.cursor()
-        c.execute("SELECT phone, first_name, last_name, city FROM users")
-        users = [{"phone": row[0], "name": f"{row[1]} {row[2]}", "city": row[3]} for row in c.fetchall()]
-        conn.close()
-        return {"total_users": len(users), "users": users}
-    except Exception as e:
-        return JSONResponse(status_code=500, content={"error": str(e)})
-
-@app.get("/admin/clear_users")
-def clear_all_users():
-    """Hatalı kayıtları sıfırlamak için tüm veritabanını siler."""
-    try:
-        conn = sqlite3.connect('database.db')
-        c = conn.cursor()
-        c.execute("DELETE FROM users")
-        conn.commit()
-        conn.close()
-        return {"success": True, "message": "Tüm kullanıcılar veritabanından başarıyla silindi. Temiz bir sayfa açıldı."}
-    except Exception as e:
-        return JSONResponse(status_code=500, content={"error": str(e)})
-
-# ==============================================================
-
-class LoginRequest(BaseModel):
-    phone: str
-    password: str
-
 @app.post("/login")
 def login_user(req: LoginRequest):
     try:
         conn = sqlite3.connect('database.db')
         c = conn.cursor()
-        c.execute("SELECT first_name, last_name FROM users WHERE phone=? AND password=?", (req.phone, req.password))
+        c.execute("SELECT first_name, last_name, city FROM users WHERE phone=? AND password=?", (req.phone, req.password))
         user = c.fetchone()
         conn.close()
         
         if user:
-            return {"success": True, "message": f"Hoşgeldiniz, {user[0]} {user[1]}!"}
+            return {
+                "success": True, 
+                "message": f"Hoşgeldiniz, {user[0]} {user[1]}!",
+                "first_name": user[0],
+                "last_name": user[1],
+                "city": user[2]
+            }
         else:
             return {"success": False, "error": "Sisteme kayıtlı değilsiniz veya şifreniz yanlış! Lütfen Kayıt Olun."}
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
 
-@app.get("/stats")
-def get_stats():
+@app.get("/get-profile")
+def get_profile(phone: str):
+    try:
+        conn = sqlite3.connect('database.db')
+        c = conn.cursor()
+        c.execute("SELECT phone, first_name, last_name, city, district, neighborhood, village, crops FROM users WHERE phone=?", (phone,))
+        row = c.fetchone()
+        conn.close()
+        if row:
+            return {
+                "success": True,
+                "phone": row[0],
+                "first_name": row[1],
+                "last_name": row[2],
+                "city": row[3],
+                "district": row[4],
+                "neighborhood": row[5],
+                "village": row[6],
+                "crops": row[7] if len(row) > 7 else ""
+            }
+        else:
+            return JSONResponse(status_code=404, content={"error": "Kullanıcı bulunamadı."})
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+@app.post("/update-profile")
+def update_profile(req: UpdateProfileRequest):
     try:
         conn = sqlite3.connect('database.db')
         c = conn.cursor()
         
-        c.execute("SELECT city, district, COUNT(*) FROM users GROUP BY city, district")
+        if req.phone != req.old_phone:
+            c.execute("SELECT phone FROM users WHERE phone=?", (req.phone,))
+            if c.fetchone():
+                conn.close()
+                return JSONResponse(status_code=400, content={"error": "Bu telefon numarası zaten başka biri tarafından kullanılıyor."})
+        
+        c.execute("""UPDATE users SET 
+                        phone=?, 
+                        first_name=?, 
+                        last_name=?, 
+                        city=?, 
+                        district=?, 
+                        neighborhood=?, 
+                        village=?,
+                        crops=? 
+                     WHERE phone=?""",
+                  (req.phone, req.first_name, req.last_name, req.city, req.district, req.neighborhood, req.village, req.crops, req.old_phone))
+        
+        # Upsert: if Render DB has reset and user is missing, insert them
+        if c.rowcount == 0:
+            c.execute("""INSERT INTO users (phone, first_name, last_name, city, district, neighborhood, village, crops) 
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                      (req.phone, req.first_name, req.last_name, req.city, req.district, req.neighborhood, req.village, req.crops))
+        
+        c.execute("UPDATE predictions SET phone=? WHERE phone=?", (req.phone, req.old_phone))
+        
+        conn.commit()
+        conn.close()
+        return {"success": True, "message": "Profil bilgileri başarıyla güncellendi."}
+    except Exception as e:
+        if 'conn' in locals() or 'conn' in globals():
+            try: conn.close()
+            except: pass
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+@app.get("/stats")
+def get_stats(city: str = None, district: str = None, label: str = None):
+    try:
+        conn = sqlite3.connect('database.db')
+        c = conn.cursor()
+        
+        # 1. Kullanıcı sayıları sorgusu
+        users_query = "SELECT city, district, COUNT(*) FROM users"
+        users_conditions = []
+        users_params = []
+        if city:
+            users_conditions.append("city = ?")
+            users_params.append(city)
+        if district:
+            users_conditions.append("district = ?")
+            users_params.append(district)
+        
+        if users_conditions:
+            users_query += " WHERE " + " AND ".join(users_conditions)
+        users_query += " GROUP BY city, district"
+        
+        c.execute(users_query, users_params)
         user_counts = [{"city": row[0], "district": row[1], "count": row[2]} for row in c.fetchall()]
         
-        c.execute("SELECT city, district, label, COUNT(*) FROM predictions GROUP BY city, district, label")
+        # 2. Tahminler / Hastalık sayıları sorgusu
+        predictions_query = "SELECT city, district, label, COUNT(*) FROM predictions"
+        pred_conditions = []
+        pred_params = []
+        if city:
+            pred_conditions.append("city = ?")
+            pred_params.append(city)
+        if district:
+            pred_conditions.append("district = ?")
+            pred_params.append(district)
+        if label:
+            pred_conditions.append("label = ?")
+            pred_params.append(label)
+            
+        if pred_conditions:
+            predictions_query += " WHERE " + " AND ".join(pred_conditions)
+        predictions_query += " GROUP BY city, district, label"
+        
+        c.execute(predictions_query, pred_params)
         disease_counts = [{"city": row[0], "district": row[1], "label": row[2], "count": row[3]} for row in c.fetchall()]
         
         conn.close()
         return {"user_counts_by_region": user_counts, "disease_counts_by_region": disease_counts}
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
-
-class StatRequest(BaseModel):
-    phone: str
-    label: str
 
 @app.post("/add_stat")
 def add_stat(req: StatRequest):
@@ -344,7 +451,6 @@ def add_stat(req: StatRequest):
         if res:
             city, district = res[0], res[1]
         
-        from datetime import datetime
         c.execute("INSERT INTO predictions (phone, label, city, district, timestamp) VALUES (?, ?, ?, ?, ?)",
                   (req.phone, req.label, city, district, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
         conn.commit()
@@ -358,7 +464,7 @@ async def predict_disease(phone: str = Form(default="Bilinmiyor"), file: UploadF
     if not my_model:
         return JSONResponse(status_code=500, content={"error": "Model not loaded on server."})
 
-    # Word dosyası değiştiyse tedavileri otomatik yenile (sunucu yeniden başlatmaya gerek yok)
+    # Word dosyası değiştiyse tedavileri otomatik yenile
     word_yenile_gerekiyorsa()
 
     try:
@@ -413,14 +519,13 @@ async def predict_disease(phone: str = Form(default="Bilinmiyor"), file: UploadF
 
             return {
                 "success": True,
-                "hastalik": formatted_disease_name,  # Android app bunlari bekliyor
+                "hastalik": formatted_disease_name,
                 "guven_skoru": float(score),
                 "tedavi": treatment
             }
         else:
             # Tanimlanamayanlar da kaydedilebilir
             try:
-                from datetime import datetime
                 dataset_folder = os.path.join(BASE_DIR, "GenelVeriseti", "Tanimlanamayan")
                 os.makedirs(dataset_folder, exist_ok=True)
                 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -436,6 +541,48 @@ async def predict_disease(phone: str = Form(default="Bilinmiyor"), file: UploadF
                 "tedavi": "Goruntuden herhangi bir bitki hastaligi yeterli guven skorunda (%70) tespit edilemedi."
             }
 
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+# ================= YÖNETİCİ (ADMIN) İŞLEMLERİ =================
+
+@app.get("/admin/users")
+def get_all_users():
+    """Sistemdeki tüm kullanıcıları listeler."""
+    try:
+        conn = sqlite3.connect('database.db')
+        c = conn.cursor()
+        c.execute("SELECT phone, first_name, last_name, city FROM users")
+        users = [{"phone": row[0], "name": f"{row[1]} {row[2]}", "city": row[3]} for row in c.fetchall()]
+        conn.close()
+        return {"total_users": len(users), "users": users}
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+@app.get("/admin/clear_users")
+def clear_all_users():
+    """Hatalı kayıtları sıfırlamak için tüm veritabanını siler."""
+    try:
+        conn = sqlite3.connect('database.db')
+        c = conn.cursor()
+        c.execute("DELETE FROM users")
+        conn.commit()
+        conn.close()
+        return {"success": True, "message": "Tüm kullanıcılar veritabanından başarıyla silindi. Temiz bir sayfa açıldı."}
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+@app.get("/reset-db")
+def reset_db():
+    try:
+        conn = sqlite3.connect('database.db')
+        c = conn.cursor()
+        c.execute("DROP TABLE IF EXISTS users")
+        c.execute("DROP TABLE IF EXISTS predictions")
+        conn.commit()
+        conn.close()
+        init_db()
+        return {"success": True, "message": "Database tables users and predictions dropped and re-initialized."}
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
 
